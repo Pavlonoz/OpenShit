@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenShit</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="titlebar">
+  <span class="titlebar-text">OpenShit</span>
+  <div class="titlebar-btns">
+    <button class="tb-btn" id="btn-min" title="Minimize">&#x2013;</button>
+    <button class="tb-btn" id="btn-close" title="Close">&times;</button>
+  </div>
+</div>
+
+<div id="sidebar">
+  <div class="nav-item active" data-tab="dashboard">
+    <svg class="nav-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+    Dashboard
+  </div>
+  <div class="nav-item" data-tab="settings">
+    <svg class="nav-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4m0 14v4M4.22 4.22l2.83 2.83m9.9 9.9l2.83 2.83M1 12h4m14 0h4M4.22 19.78l2.83-2.83m9.9-9.9l2.83-2.83"/></svg>
+    Settings
+  </div>
+  <div class="nav-item" data-tab="generate">
+    <svg class="nav-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    Generate
+  </div>
+  <div class="nav-item" data-tab="logs">
+    <svg class="nav-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+    Logs
+  </div>
+  <div class="sidebar-spacer"></div>
+  <div class="proxy-status" id="proxy-indicator">
+    <span class="status-dot off"></span> <span id="proxy-label">Proxy Offline</span>
+  </div>
+</div>
+
+<div id="content">
+
+  <div class="tab active" id="tab-dashboard">
+    <div class="tab-header">
+      <h2>Dashboard</h2>
+      <div style="display:flex;gap:8px">
+        <span class="live-badge" id="live-badge">LIVE</span>
+        <button class="btn" id="btn-proxy-toggle">Start Proxy</button>
+      </div>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-label">Accounts</div>
+        <div class="stat-value" id="stat-accounts">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">5h Window Used</div>
+        <div class="stat-value" id="stat-window">0 / 0</div>
+        <div class="stat-bar-wrap"><div class="stat-bar" id="stat-window-bar"></div></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Proxy Requests</div>
+        <div class="stat-value" id="stat-requests">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Combined Weekly</div>
+        <div class="stat-value" id="stat-weekly">0</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <table id="token-table">
+        <thead>
+          <tr><th>#</th><th>Email</th><th>Window</th><th>API Key</th><th>Plan</th></tr>
+        </thead>
+        <tbody id="token-tbody"></tbody>
+      </table>
+      <p class="empty-msg" id="empty-tokens">No tokens loaded. Go to Generate.</p>
+    </div>
+
+    <div class="panel" id="setup-panel">
+      <h3>Client Setup</h3>
+      <div class="client-setup">
+        <div class="client-card">
+          <div class="client-name">OpenCode</div>
+          <p>Writes config + auth to standard OpenCode paths.</p>
+          <button class="btn secondary" id="btn-setup-opencode">Configure OpenCode</button>
+          <span id="opencode-status"></span>
+        </div>
+        <div class="client-card">
+          <div class="client-name">Claude Code</div>
+          <p>Writes .claude.json + desktop launcher .bat</p>
+          <button class="btn secondary" id="btn-setup-claude">Configure Claude Code</button>
+          <span id="claude-status"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-settings">
+    <div class="tab-header">
+      <h2>Settings</h2>
+      <button class="btn" id="btn-save-settings">Save</button>
+    </div>
+    <div class="panel">
+      <div class="form-group">
+        <label>Gmail Address</label>
+        <input type="text" id="cfg-email-base" placeholder="you@gmail.com">
+        <span class="hint">Use plus addressing: you+1, you+2, ...</span>
+      </div>
+      <div class="form-group">
+        <label>Gmail App Password</label>
+        <input type="password" id="cfg-email-pass" placeholder="16-char app password">
+        <span class="hint">myaccount.google.com/apppasswords &mdash; requires 2FA</span>
+      </div>
+      <div class="form-group">
+        <label>Shared Account Password</label>
+        <input type="password" id="cfg-account-pass" placeholder="Password for all accounts">
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Accounts</label><input type="number" id="cfg-count" min="1" max="50" value="5"></div>
+        <div class="form-group"><label>Start Index</label><input type="number" id="cfg-start" min="1" value="1"></div>
+        <div class="form-group"><label>Proxy Port</label><input type="number" id="cfg-port" min="1024" max="65535" value="8787"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Python</h3>
+      <p id="python-status">Checking...</p>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-generate">
+    <div class="tab-header">
+      <h2>Generate Tokens</h2>
+      <button class="btn" id="btn-generate">Generate</button>
+    </div>
+    <div class="panel">
+      <p>Creates accounts, verifies emails, generates API tokens.</p>
+      <div class="gen-progress" id="gen-progress-wrap" style="display:none">
+        <div class="gen-progress-bar" id="gen-progress-bar"></div>
+      </div>
+      <pre id="gen-output" class="log-output">Ready.</pre>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-logs">
+    <div class="tab-header">
+      <h2>Proxy Logs</h2>
+      <button class="btn" id="btn-clear-logs">Clear</button>
+    </div>
+    <div class="panel">
+      <pre id="log-output" class="log-output">Proxy not started.</pre>
+    </div>
+  </div>
+
+</div>
+
+<script src="renderer.js"></script>
+</body>
+</html>

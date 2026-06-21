@@ -1,0 +1,12 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+tokens.json
+config.json
+*.exe
+.env
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log

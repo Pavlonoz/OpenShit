@@ -1,0 +1,13 @@
+{
+  "email_base": "you@gmail.com",
+  "email_password": "your-gmail-app-password",
+  "account_password": "shared-account-password",
+  "account_count": 5,
+  "start_index": 1,
+  "proxy_port": 8787,
+  "proxy_host": "127.0.0.1",
+  "delay_between_registrations": 3,
+  "opference_base": "https://openference.com",
+  "opference_api_base": "https://api.openference.com",
+  "registration_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+}
