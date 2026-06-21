@@ -479,7 +479,12 @@ def proxy_chat():
             time.sleep(1)
             continue
 
-        if upstream.status_code in (401, 403):
+        if upstream.status_code in (401, 403, 429):
+            if upstream.status_code == 429:
+                with TOKEN_LOCK:
+                    if api_key in USAGE:
+                        USAGE[api_key]["window_count"] = USAGE[api_key]["window_limit"]
+                        USAGE[api_key]["minute_count"] = USAGE[api_key]["max_rpm"]
             mark_token_error(api_key)
             time.sleep(0.5)
             continue

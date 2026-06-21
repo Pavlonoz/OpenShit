@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 import time
 import threading
@@ -10,8 +9,8 @@ from pathlib import Path
 import requests
 from flask import Flask, request, Response, jsonify, stream_with_context
 
-CONFIG_PATH = Path(os.environ.get("OSH_CONFIG_PATH", str(Path(__file__).parent / "config.json")))
-TOKENS_PATH = Path(os.environ.get("OSH_TOKENS_PATH", str(Path(__file__).parent / "tokens.json")))
+CONFIG_PATH = Path(__file__).parent / "config.json"
+TOKENS_PATH = Path(__file__).parent / "tokens.json"
 
 app = Flask(__name__)
 
@@ -480,7 +479,12 @@ def proxy_chat():
             time.sleep(1)
             continue
 
-        if upstream.status_code in (401, 403):
+        if upstream.status_code in (401, 403, 429):
+            if upstream.status_code == 429:
+                with TOKEN_LOCK:
+                    if api_key in USAGE:
+                        USAGE[api_key]["window_count"] = USAGE[api_key]["window_limit"]
+                        USAGE[api_key]["minute_count"] = USAGE[api_key]["max_rpm"]
             mark_token_error(api_key)
             time.sleep(0.5)
             continue
