@@ -89,14 +89,9 @@ def generate_tokens():
     config = load_json(CONFIG_PATH)
     count = config.get("account_count", 5)
     start = config.get("start_index", 1)
-    email = config.get("email_base", "?")
-    pw = config.get("email_password", "")
+    prefix = config.get("email_base", "user").split("@")[0]
 
-    if pw in ("", "YOUR_GMAIL_APP_PASSWORD_HERE"):
-        console.print("[red]Set email_password in config.json first![/]")
-        return
-
-    console.print(f"\n[bold]Will create [cyan]{count}[/] accounts starting from [cyan]{email.split('@')[0]}+{start}@{email.split('@')[1]}[/][/]")
+    console.print(f"\n[bold]Will create [cyan]{count}[/] accounts using temp emails: [cyan]{prefix}{start}@*.tm[/] ...[/]")
     if not Confirm.ask("Proceed?", default=True):
         return
 
@@ -126,15 +121,14 @@ def configure():
     console.print()
     if Confirm.ask("Edit configuration?", default=False):
         console.print("\n[bold]Available settings to change:[/]")
-        console.print("  [cyan]email_base[/]       - Gmail address (e.g. you@gmail.com)")
-        console.print("  [cyan]email_password[/]   - Gmail app password for IMAP")
+        console.print("  [cyan]email_base[/]       - Username prefix for temp emails (e.g. myuser)")
         console.print("  [cyan]account_password[/] - Password for all Openference accounts")
         console.print("  [cyan]account_count[/]    - How many accounts to create")
-        console.print("  [cyan]start_index[/]      - Starting number for email+N")
+        console.print("  [cyan]start_index[/]      - Starting number for temp email index")
         console.print("  [cyan]proxy_port[/]       - Port for local proxy (default 8787)")
         console.print()
 
-        for key in ["email_base", "email_password", "account_password", "account_count", "start_index", "proxy_port"]:
+        for key in ["email_base", "account_password", "account_count", "start_index", "proxy_port"]:
             if key in config:
                 current = config[key]
                 mask = "****" if "password" in key.lower() and current else str(current)

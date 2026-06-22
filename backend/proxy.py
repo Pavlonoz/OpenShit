@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 import threading
@@ -9,8 +10,8 @@ from pathlib import Path
 import requests
 from flask import Flask, request, Response, jsonify, stream_with_context
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-TOKENS_PATH = Path(__file__).parent / "tokens.json"
+CONFIG_PATH = Path(os.environ.get("OSH_CONFIG_PATH", str(Path(__file__).parent / "config.json")))
+TOKENS_PATH = Path(os.environ.get("OSH_TOKENS_PATH", str(Path(__file__).parent / "tokens.json")))
 
 app = Flask(__name__)
 
@@ -602,6 +603,15 @@ def sync_usage_loop(interval=45):
         time.sleep(interval)
         try:
             sync_usage_from_api()
+        except Exception:
+            pass
+        try:
+            global TOKENS
+            fresh = load_tokens()
+            if fresh and len(fresh) != len(TOKENS):
+                TOKENS = fresh
+                init_usage(TOKENS)
+                print(f"[sync] Reloaded tokens: {len(TOKENS)} total")
         except Exception:
             pass
 

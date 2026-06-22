@@ -604,6 +604,15 @@ def sync_usage_loop(interval=45):
             sync_usage_from_api()
         except Exception:
             pass
+        try:
+            global TOKENS
+            fresh = load_tokens()
+            if fresh and len(fresh) != len(TOKENS):
+                TOKENS = fresh
+                init_usage(TOKENS)
+                print(f"[sync] Reloaded tokens: {len(TOKENS)} total")
+        except Exception:
+            pass
 
 
 @app.route("/", methods=["GET"])

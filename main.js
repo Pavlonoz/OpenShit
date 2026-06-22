@@ -43,7 +43,6 @@ function loadConfig() {
   }
   return {
     email_base: "",
-    email_password: "",
     account_password: "",
     account_count: 5,
     start_index: 1,

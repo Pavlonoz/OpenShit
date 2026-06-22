@@ -2,11 +2,8 @@ import json
 import os
 import re
 import time
-import imaplib
-import email
 import sys
 from datetime import datetime, timezone
-from email.header import decode_header
 from pathlib import Path
 
 import requests
@@ -18,6 +15,9 @@ if "OSH_CONFIG_PATH" in os.environ:
     CONFIG_PATH = Path(os.environ["OSH_CONFIG_PATH"])
 TOKENS_PATH = Path(os.environ.get("OSH_TOKENS_PATH", str(Path(__file__).parent / "tokens.json")))
 NO_INPUT = True
+SKIP_REGISTER = False
+
+MAILTM_APIS = ["https://api.mail.tm", "https://api.mail.gw"]
 
 
 def load_config():
@@ -54,10 +54,65 @@ def make_headers(session_token=None, api_key=None):
     return headers
 
 
-def generate_alias_email(config, index):
-    base = config["email_base"]
-    name, domain = base.split("@", 1)
-    return f"{name}+{index}@{domain}"
+def _mailtm_request(method, path, json_data=None, headers=None, timeout=15):
+    for base in MAILTM_APIS:
+        url = f"{base}{path}"
+        try:
+            if method == "post":
+                r = requests.post(url, json=json_data, headers=headers or {}, timeout=timeout)
+            else:
+                r = requests.get(url, headers=headers or {}, timeout=timeout)
+            if r.status_code in (200, 201):
+                return r
+        except Exception:
+            continue
+    return None
+
+
+def create_mailtm_account(config, index):
+    username = config.get("email_base", "user").split("@")[0] + str(index)
+    password = config["account_password"]
+
+    r = _mailtm_request("get", "/domains")
+    if r is None:
+        print(f"  Failed to fetch mail.tm domains")
+        return None, None
+    domains = r.json().get("hydra:member", [])
+    if not domains:
+        print(f"  No mail.tm domains available")
+        return None, None
+    domain = domains[0]["domain"]
+    email_addr = f"{username}@{domain}"
+
+    r = _mailtm_request("post", "/accounts", json_data={"address": email_addr, "password": password})
+    if r is None:
+        print(f"  Failed to create mail.tm account")
+        return None, None
+    data = r.json()
+    return data.get("address", email_addr), password
+
+
+def poll_mailtm_for_verification(config, email_addr, password):
+    r = _mailtm_request("post", "/token", json_data={"address": email_addr, "password": password})
+    if r is None:
+        return None
+    token = r.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    r = _mailtm_request("get", "/messages", headers=headers)
+    if r is None:
+        return None
+    messages = r.json().get("hydra:member", [])
+    for msg in messages:
+        msg_id = msg["id"]
+        r = _mailtm_request("get", f"/messages/{msg_id}", headers=headers)
+        if r is None:
+            continue
+        body = r.json().get("text", "") or r.json().get("html", "") or ""
+        pattern = r'https://openference\.com/auth/verify-email\?token=[^\s"\'<>&]+'
+        match = re.search(pattern, body)
+        if match:
+            return match.group(0)
+    return None
 
 
 def register_account(config, email, password):
@@ -145,95 +200,6 @@ def verify_email(config, verification_url):
     return r.status_code in (200, 301, 302, 303, 307, 308)
 
 
-def get_verification_token_from_email(config, for_email):
-    cfg = config
-    email_user = cfg["email_base"]
-    email_pass = cfg["email_password"]
-
-    if not email_pass or email_pass == "YOUR_GMAIL_APP_PASSWORD_HERE":
-        return None
-
-    try:
-        imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        imap.login(email_user, email_pass)
-        imap.select("INBOX")
-    except imaplib.IMAP4.error as e:
-        print(f"  IMAP login failed: {e}. Get app password at https://myaccount.google.com/apppasswords")
-        return None
-    except Exception as e:
-        print(f"  IMAP error: {e}")
-        return None
-
-    search_query = f'X-GM-RAW "to:{for_email} from:noreply@openference.com"'
-    try:
-        status, messages = imap.search(None, search_query)
-    except imaplib.IMAP4.error:
-        try:
-            imap.logout()
-        except Exception:
-            pass
-        return None
-
-    if status != "OK":
-        try:
-            imap.logout()
-        except Exception:
-            pass
-        return None
-
-    msg_ids = messages[0].split()
-    if not msg_ids:
-        try:
-            imap.logout()
-        except Exception:
-            pass
-        return None
-
-    for msg_id in reversed(msg_ids):
-        status, msg_data = imap.fetch(msg_id, "(RFC822)")
-        if status != "OK":
-            continue
-
-        raw = msg_data[0][1]
-        msg = email.message_from_bytes(raw)
-
-        msg_to = msg.get("To", "")
-        if for_email.lower() not in msg_to.lower().replace(" ", ""):
-            continue
-
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                cdisp = str(part.get("Content-Disposition", ""))
-                if ctype in ("text/plain", "text/html") and "attachment" not in cdisp:
-                    try:
-                        body += part.get_payload(decode=True).decode(errors="ignore")
-                    except Exception:
-                        pass
-        else:
-            try:
-                body = msg.get_payload(decode=True).decode(errors="ignore")
-            except Exception:
-                pass
-
-        if body:
-            pattern = r'https://openference\.com/auth/verify-email\?token=[^\s"\'<>&]+'
-            match = re.search(pattern, body)
-            if match:
-                try:
-                    imap.logout()
-                except Exception:
-                    pass
-                return match.group(0)
-
-    try:
-        imap.logout()
-    except Exception:
-        pass
-    return None
-
-
 def fetch_plan_limits(config, session_token):
     url = f"{config.get('openference_base', 'https://openference.com')}/api/user/me"
     r = requests.get(url, headers=make_headers(session_token=session_token), timeout=30)
@@ -275,7 +241,10 @@ def create_api_token(config, session_token, name="auto-token"):
 
 
 def process_one_account(config, index):
-    email_addr = generate_alias_email(config, index)
+    email_addr, temp_password = create_mailtm_account(config, index)
+    if not email_addr:
+        return None
+
     password = config["account_password"]
     print(f"\n{'='*60}")
     print(f"Processing account #{index}: {email_addr}")
@@ -293,7 +262,7 @@ def process_one_account(config, index):
     for attempt in range(8):
         if attempt > 0:
             time.sleep(4)
-        verify_url = get_verification_token_from_email(config, email_addr)
+        verify_url = poll_mailtm_for_verification(config, email_addr, temp_password)
         if verify_url:
             print(f"  Found verification link on attempt {attempt+1}!")
             break
@@ -303,25 +272,7 @@ def process_one_account(config, index):
             print(f"  Waiting for email... ({attempt+1}/8)")
 
     if not verify_url:
-        if NO_INPUT:
-            print(f"  No IMAP access and running non-interactively. Skipping verification.")
-        else:
-            print(f"\n  {'='*50}")
-            print(f"  Could not auto-verify via IMAP.")
-            print(f"  Check your inbox ({config['email_base']}) for an email from noreply@openference.com")
-            print(f"  It was sent to: {email_addr}")
-            print(f"  ")
-            print(f"  OPTION 1: Paste the verification link below")
-            print(f"  OPTION 2: Press Enter to skip (account may not work)")
-            print(f"  {'='*50}")
-            manual = input(f"  Link: ").strip()
-            if manual:
-                if "openference.com/auth/verify-email" in manual:
-                    verify_url = manual
-                else:
-                    print(f"  That doesn't look like a verification link. Skipping.")
-            else:
-                print(f"  Skipping verification. Login may fail.")
+        print(f"  Could not auto-verify. Skipping verification.")
 
     if verify_url:
         if verify_email(config, verify_url):
@@ -375,7 +326,7 @@ def main():
     delay_reg = config.get("delay_between_registrations", 3)
 
     existing = load_tokens()
-    existing_emails = {t["email"] for t in existing}
+    existing_indices = {t["index"] for t in existing}
     new_tokens = []
 
     print(f"\n{'='*60}")
@@ -394,9 +345,8 @@ def main():
         print("[!] No proxy file found. Direct connection only.")
 
     for i in range(start, start + count):
-        email_addr = generate_alias_email(config, i)
-        if email_addr in existing_emails:
-            print(f"\nSkipping {email_addr} (already in tokens.json)")
+        if i in existing_indices:
+            print(f"\nSkipping index #{i} (already in tokens.json)")
             continue
 
         entry = process_one_account(config, i)

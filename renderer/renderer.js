@@ -212,7 +212,6 @@ function renderDashboard() {
 
 function renderSettings() {
   document.getElementById("cfg-email-base").value = config.email_base || "";
-  document.getElementById("cfg-email-pass").value = config.email_password || "";
   document.getElementById("cfg-account-pass").value = config.account_password || "";
   document.getElementById("cfg-count").value = config.account_count || 5;
   document.getElementById("cfg-start").value = config.start_index || 1;
@@ -221,7 +220,6 @@ function renderSettings() {
 
 async function saveSettings() {
   config.email_base = document.getElementById("cfg-email-base").value.trim();
-  config.email_password = document.getElementById("cfg-email-pass").value.trim();
   config.account_password = document.getElementById("cfg-account-pass").value.trim();
   config.account_count = parseInt(document.getElementById("cfg-count").value) || 5;
   config.start_index = parseInt(document.getElementById("cfg-start").value) || 1;
