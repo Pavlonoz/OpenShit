@@ -1,13 +1,32 @@
 import json
+import os
+import re
 import sys
 import time
 import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from flask import Flask, request, Response, jsonify, stream_with_context
+import logging
+log = logging.getLogger("werkzeug")
+log.setLevel(logging.ERROR)
+
+from proxy_rotator import (
+    make_request as proxied_request,
+    load_and_filter,
+    test_proxy_batch,
+    has_proxies,
+    proxy_count,
+    refresh_proxies,
+)
+
+RESIDENTIAL_FILE = Path(__file__).parent / "residential_proxies.txt"
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 TOKENS_PATH = Path(__file__).parent / "tokens.json"
@@ -17,6 +36,7 @@ app = Flask(__name__)
 TOKENS = []
 TOKEN_INDEX = 0
 TOKEN_LOCK = threading.Lock()
+TOKEN_EVENT = threading.Event()
 
 USAGE = {}
 REAL_USAGE = {}
@@ -24,6 +44,16 @@ SYNC_LOCK = threading.Lock()
 
 OPENFERENCE_API = "https://api.openference.com"
 OPENFERENCE_WEB = "https://openference.com"
+
+AUTO_GEN_LOCK = threading.Lock()
+_auto_gen_running = False
+_last_auto_gen = 0
+_auto_gen_min_interval = 60
+
+_auto_gen_enabled = True
+_auto_gen_threshold = 0.5
+_auto_gen_count = 2
+_auto_gen_min_tokens = 3
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -83,12 +113,14 @@ tr:hover{background:#1c2128}
 footer{text-align:center;color:#484f58;font-size:12px;padding:24px}
 a{color:#58a6ff;text-decoration:none}
 a:hover{text-decoration:underline}
+.auto-gen-badge{background:#1f6feb;color:#fff;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600;margin-left:8px;display:none}
 </style>
 </head>
 <body>
 <div class="header">
   <h1>Openshit Proxy</h1>
   <div>
+    <span class="auto-gen-badge" id="autoGenBadge">AUTO-GEN ACTIVE</span>
     <span class="badge" id="tokenCount">0 tokens</span>
   </div>
 </div>
@@ -108,7 +140,7 @@ a:hover{text-decoration:underline}
 
   <div id="tab-status">
     <div class="panel">
-      <h2>Token Usage</h2>
+      <h2>Token Usage <span style="font-size:12px;color:#8b949e;font-weight:normal;margin-left:8px" id="proxyStatus"></span></h2>
       <div id="tokenTable"></div>
     </div>
   </div>
@@ -116,7 +148,7 @@ a:hover{text-decoration:underline}
   <div id="tab-generate" style="display:none">
     <div class="panel">
       <h2>Generate API Tokens</h2>
-      <p style="color:#8b949e;font-size:14px;margin-bottom:16px">Create new Openference accounts and generate API tokens. Make sure your config.json has the correct Gmail credentials.</p>
+      <p style="color:#8b949e;font-size:14px;margin-bottom:16px">Create new Openference accounts. Auto-generation creates tokens when usage hits 50%.</p>
       <div class="form-row">
         <div class="form-group"><label>Number of accounts</label><input class="input" type="number" id="genCount" value="3" min="1" max="20"></div>
         <div class="form-group"><label>Starting index</label><input class="input" type="number" id="genStart" value="1" min="1"></div>
@@ -137,7 +169,7 @@ a:hover{text-decoration:underline}
         <p>Set these environment variables before launching Claude Code:</p>
         <pre>set ANTHROPIC_BASE_URL=http://{host}:{port}/v1
 set ANTHROPIC_API_KEY=anything</pre>
-        <p>Then run <code>claude</code> as usual. Works with VS Code extension and CLI.</p>
+        <p>Then run <code>claude</code> as usual.</p>
       </div>
     </div>
     <div class="panel">
@@ -204,6 +236,12 @@ function statusClass(pct) {
 
 function renderStatus(data) {
   document.getElementById('tokenCount').textContent = data.tokens_loaded + ' tokens';
+  if (data.auto_gen) {
+    document.getElementById('autoGenBadge').style.display = 'inline-block';
+    document.getElementById('autoGenBadge').textContent = 'AUTO-GEN: ' + data.auto_gen;
+  } else {
+    document.getElementById('autoGenBadge').style.display = 'none';
+  }
   const usage = data.usage;
   const keys = Object.keys(usage);
 
@@ -219,24 +257,33 @@ function renderStatus(data) {
   document.getElementById('statRate').textContent = totalRate + '/min';
   document.getElementById('statWeekly').textContent = totalWeekly;
 
-  let html = '<table><tr><th>#</th><th>Email</th><th>Proxy</th><th>Real Req</th><th>Real Tok</th><th>Cost</th><th></th></tr>';
+  document.getElementById('proxyStatus').textContent =
+    'Proxies: ' + (data.proxies_available || 0) + ' | ' +
+    'Auto-gen: ' + (data.auto_gen_enabled ? 'ON (' + (data.auto_gen_threshold*100) + '%)' : 'OFF');
+
+  let html = '<table><tr><th>#</th><th>Email</th><th>Usage %</th><th>Req (proxy)</th><th>Real Req</th><th>Real Tok</th><th>Cost</th><th></th></tr>';
   keys.forEach((k, i) => {
     const u = usage[k];
     const real = u.real || {};
-    const mp = u.minute_count / u.max_rpm * 100;
-    const sc = statusClass(mp);
+    const maxPct = Math.max(
+      u.max_rpm > 0 ? u.minute_count / u.max_rpm * 100 : 0,
+      u.window_limit > 0 ? u.window_count / u.window_limit * 100 : 0,
+      u.week_limit > 0 ? u.week_count / u.week_limit * 100 : 0
+    );
+    const sc = statusClass(maxPct);
     html += `<tr>
       <td style="color:#484f58">${i+1}</td>
       <td style="color:#58a6ff">${u.email}</td>
-      <td>${u.total_count}<div class="progress-bar"><div class="progress-fill ${progressClass(mp)}" style="width:${Math.min(mp,100)}%"></div></div></td>
+      <td>${maxPct.toFixed(0)}%<div class="progress-bar"><div class="progress-fill ${progressClass(maxPct)}" style="width:${Math.min(maxPct,100)}%"></div></div></td>
+      <td>${u.total_count}</td>
       <td style="color:#7ee787">${real.requests_total ?? '...'}</td>
       <td style="color:#d2a8ff">${real.tokens_total ?? '...'}</td>
-      <td style="color:#ffa657">$${(real.cost_total ?? 0)}</td>
+      <td style="color:#ffa657">$${(real.cost_total ?? 0).toFixed(4)}</td>
       <td><span class="status-dot ${sc}"></span></td>
     </tr>`;
   });
   if (keys.length === 0) {
-    html += '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:40px">No tokens loaded. Generate some first!</td></tr>';
+    html += '<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:40px">No tokens loaded. Generate some first!</td></tr>';
   }
   html += '</table>';
   document.getElementById('tokenTable').innerHTML = html;
@@ -247,7 +294,7 @@ function loadStatus() {
     .then(r => r.json())
     .then(data => renderStatus(data))
     .catch(e => {
-      document.getElementById('tokenTable').innerHTML = '<p style="color:#da3633;text-align:center;padding:20px">Could not load status. Is the proxy running?</p>';
+      document.getElementById('tokenTable').innerHTML = '<p style="color:#da3633;text-align:center;padding:20px">Could not load status.</p>';
       console.error(e);
     });
 }
@@ -276,7 +323,7 @@ function generateTokens() {
   fetch('/api/proxy/generate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({count: parseInt(count), start: parseInt(start)})
+    body: JSON.stringify({count: parseInt(count), start: parseInt(start), threaded: true})
   })
   .then(r => r.json())
   .then(data => {
@@ -322,6 +369,11 @@ def load_tokens():
     return []
 
 
+def save_tokens(tokens):
+    with open(TOKENS_PATH, "w") as f:
+        json.dump(tokens, f, indent=2)
+
+
 def init_usage(tokens):
     global USAGE
     USAGE = {}
@@ -347,11 +399,9 @@ def init_usage(tokens):
         }
 
 
-def peek_best_token():
-    global TOKEN_INDEX
-    now = time.time()
-
+def acquire_token():
     with TOKEN_LOCK:
+        now = time.time()
         available = []
         for key, stats in USAGE.items():
             if now - stats["minute_start"] > 60:
@@ -364,11 +414,11 @@ def peek_best_token():
                 stats["week_start"] = now
                 stats["week_count"] = 0
 
-            can_use = True
             rpm_limit = max(stats["max_rpm"], 10)
             win_limit = max(stats["window_limit"], 10)
             wk_limit = max(stats["week_limit"], 100)
 
+            can_use = True
             if stats["minute_count"] >= rpm_limit * 0.9:
                 can_use = False
             if stats["window_count"] >= win_limit * 0.9:
@@ -379,43 +429,88 @@ def peek_best_token():
             available.append((key, can_use, stats))
 
         usable = [(k, s) for k, can, s in available if can]
+        closest_to_limit = None
+
         if usable:
-            usable.sort(key=lambda x: x[1]["minute_count"])
-            return usable[0][0]
+            usable.sort(key=lambda x: (
+                x[1]["minute_count"] / max(x[1]["max_rpm"], 1),
+                x[1]["window_count"] / max(x[1]["window_limit"], 1),
+                x[1]["week_count"] / max(x[1]["week_limit"], 1),
+            ))
+            closest_to_limit = usable[-1]
+            selected_key = usable[0][0]
+        else:
+            exhausted = [(k, s) for k, can, s in available if not can]
+            if exhausted:
+                exhausted.sort(key=lambda x: min(
+                    x[1]["minute_count"] / max(x[1]["max_rpm"], 1),
+                    x[1]["window_count"] / max(x[1]["window_limit"], 1),
+                    x[1]["week_count"] / max(x[1]["week_limit"], 1),
+                ))
+                closest_to_limit = exhausted[0]
+                selected_key = exhausted[0][0]
+            elif TOKENS:
+                selected_key = TOKENS[0]["api_key"]
+                closest_to_limit = None
+            else:
+                return None, None
 
-        exhausted = [(k, s) for k, can, s in available if not can]
-        if exhausted:
-            exhausted.sort(key=lambda x: min(x[1]["minute_count"], x[1]["window_count"], x[1]["week_count"]))
-            return exhausted[0][0]
+        if selected_key in USAGE:
+            USAGE[selected_key]["minute_count"] += 1
+            USAGE[selected_key]["window_count"] += 1
+            USAGE[selected_key]["week_count"] += 1
+            USAGE[selected_key]["total_count"] += 1
+            USAGE[selected_key]["last_used"] = now
 
-        if TOKENS:
-            return TOKENS[TOKEN_INDEX % len(TOKENS)]["api_key"]
-
-        return None
+        return selected_key, closest_to_limit
 
 
-def count_request(api_key):
-    now = time.time()
+def get_token_usage_pct(api_key):
     with TOKEN_LOCK:
-        if api_key in USAGE:
-            USAGE[api_key]["minute_count"] += 1
-            USAGE[api_key]["window_count"] += 1
-            USAGE[api_key]["week_count"] += 1
-            USAGE[api_key]["total_count"] += 1
-            USAGE[api_key]["last_used"] = now
+        if api_key not in USAGE:
+            return 0.0
+        s = USAGE[api_key]
+        pcts = []
+        if s["max_rpm"] > 0:
+            pcts.append(s["minute_count"] / s["max_rpm"])
+        if s["window_limit"] > 0:
+            pcts.append(s["window_count"] / s["window_limit"])
+        if s["week_limit"] > 0:
+            pcts.append(s["week_count"] / s["week_limit"])
+        return max(pcts) if pcts else 0.0
 
 
-def get_best_token():
-    key = peek_best_token()
-    if key:
-        count_request(key)
-    return key
+def get_min_token_usage_pct():
+    with TOKEN_LOCK:
+        if not USAGE:
+            return 1.0
+        min_pct = 1.0
+        for key, stats in USAGE.items():
+            pcts = []
+            if stats["max_rpm"] > 0:
+                pcts.append(stats["minute_count"] / stats["max_rpm"])
+            if stats["window_limit"] > 0:
+                pcts.append(stats["window_count"] / stats["window_limit"])
+            if stats["week_limit"] > 0:
+                pcts.append(stats["week_count"] / stats["week_limit"])
+            pct = max(pcts) if pcts else 0.0
+            if pct < min_pct:
+                min_pct = pct
+        return min_pct
 
 
 def mark_token_error(api_key):
     with TOKEN_LOCK:
         if api_key in USAGE:
             USAGE[api_key]["errors"] += 1
+
+
+def mark_token_exhausted(api_key):
+    with TOKEN_LOCK:
+        if api_key in USAGE:
+            USAGE[api_key]["window_count"] = USAGE[api_key]["window_limit"]
+            USAGE[api_key]["minute_count"] = USAGE[api_key]["max_rpm"]
+            USAGE[api_key]["week_count"] = USAGE[api_key]["week_limit"]
 
 
 def proxy_headers():
@@ -430,15 +525,20 @@ def proxy_headers():
 
 @app.route("/v1/models", methods=["GET"])
 def proxy_models():
-    api_key = get_best_token()
+    api_key, _ = acquire_token()
     if not api_key:
         return jsonify({"error": "No tokens available"}), 503
 
-    resp = requests.get(
-        f"{OPENFERENCE_API}/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
+    try:
+        resp = proxied_request("GET",
+            f"{OPENFERENCE_API}/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except Exception as e:
+        mark_token_error(api_key)
+        return jsonify({"error": str(e)}), 502
+
     return Response(resp.content, status=resp.status_code,
                     content_type=resp.headers.get("Content-Type", "application/json"))
 
@@ -464,27 +564,29 @@ def proxy_chat():
     body = request.get_json(force=True, silent=True) or {}
     is_stream = body.get("stream", False)
 
-    max_retries = max(len(TOKENS) * 2, 3)
+    max_retries = max(len(TOKENS) * 3, 5)
     server_errors = 0
-    last_api_key = None
+    last_status = None
+
     for attempt in range(max_retries):
-        api_key = peek_best_token()
+        api_key, _ = acquire_token()
         if not api_key:
             return jsonify({"error": "No tokens available"}), 503
 
         try:
             upstream, _ = do_chat_request(body, api_key)
-        except requests.RequestException as e:
+        except Exception as e:
             mark_token_error(api_key)
-            time.sleep(1)
+            time.sleep(0.5)
             continue
 
-        if upstream.status_code in (401, 403, 429):
-            if upstream.status_code == 429:
-                with TOKEN_LOCK:
-                    if api_key in USAGE:
-                        USAGE[api_key]["window_count"] = USAGE[api_key]["window_limit"]
-                        USAGE[api_key]["minute_count"] = USAGE[api_key]["max_rpm"]
+        if upstream.status_code in (401, 403):
+            mark_token_error(api_key)
+            time.sleep(0.3)
+            continue
+
+        if upstream.status_code == 429:
+            mark_token_exhausted(api_key)
             mark_token_error(api_key)
             time.sleep(0.5)
             continue
@@ -495,10 +597,10 @@ def proxy_chat():
                 time.sleep(1.5 * (attempt + 1))
                 continue
 
-        count_request(api_key)
+        last_status = upstream.status_code
         break
     else:
-        return jsonify({"error": "All tokens failed or exhausted."}), 502
+        return jsonify({"error": "All tokens failed or exhausted.", "status": last_status}), 502
 
     if not is_stream:
         return Response(upstream.content, status=upstream.status_code,
@@ -528,7 +630,7 @@ def proxy_v1(subpath):
     if request.method == "OPTIONS":
         return Response(status=200)
 
-    api_key = get_best_token()
+    api_key, _ = acquire_token()
     if not api_key:
         return jsonify({"error": "No tokens available"}), 503
 
@@ -538,13 +640,13 @@ def proxy_v1(subpath):
 
     try:
         if request.method == "GET":
-            r = requests.get(url, headers=headers, timeout=60, params=request.args)
+            r = proxied_request("GET", url, headers=headers, timeout=60, params=request.args)
         elif request.method == "POST":
-            r = requests.post(url, headers=headers, timeout=60, json=request.get_json(silent=True) or {})
+            r = proxied_request("POST", url, headers=headers, timeout=60, json=request.get_json(silent=True) or {})
         else:
-            r = requests.request(request.method, url, headers=headers, timeout=60,
+            r = proxied_request(request.method, url, headers=headers, timeout=60,
                                 data=request.get_data(), params=request.args)
-    except requests.RequestException as e:
+    except Exception as e:
         mark_token_error(api_key)
         return jsonify({"error": str(e)}), 502
 
@@ -561,7 +663,7 @@ def sync_usage_from_api():
                 continue
             api_key = t["api_key"]
             try:
-                r = requests.get(
+                r = proxied_request("GET",
                     f"{OPENFERENCE_WEB}/api/user/usage?days=1",
                     headers={"Authorization": f"Bearer {session}"},
                     timeout=10,
@@ -597,15 +699,129 @@ def sync_usage_from_api():
                 pass
 
 
-def sync_usage_loop(interval=45):
+def auto_generate_tokens(reason=""):
+    global _auto_gen_running, _last_auto_gen, TOKENS
+
+    with AUTO_GEN_LOCK:
+        if _auto_gen_running:
+            return
+        now = time.time()
+        if now - _last_auto_gen < _auto_gen_min_interval:
+            return
+        _auto_gen_running = True
+        _last_auto_gen = now
+
+    try:
+        config = load_config()
+        existing = load_tokens()
+        existing_indices = {t["index"] for t in existing}
+        next_index = max(existing_indices) + 1 if existing_indices else config.get("start_index", 1)
+        count = config.get("auto_gen_count", _auto_gen_count)
+
+        print(f"\n[AUTO-GEN] Triggered ({reason}). Creating {count} accounts starting at #{next_index}...")
+
+        from token_manager import process_one_account as process_account
+
+        results = []
+        with ThreadPoolExecutor(max_workers=min(count, 4)) as executor:
+            futures = {
+                executor.submit(process_account, config, next_index + i): next_index + i
+                for i in range(count)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    entry = future.result(timeout=120)
+                    if entry:
+                        results.append(entry)
+                        print(f"  [AUTO-GEN] Account #{idx} created: {entry.get('email')}")
+                except Exception as e:
+                    print(f"  [AUTO-GEN] Account #{idx} failed: {e}")
+
+        if results:
+            all_tokens = existing + results
+            save_tokens(all_tokens)
+            TOKENS = all_tokens
+            init_usage(TOKENS)
+            print(f"[AUTO-GEN] Successfully added {len(results)} new tokens. Total: {len(TOKENS)}")
+        else:
+            print(f"[AUTO-GEN] No new tokens created.")
+
+    except Exception as e:
+        print(f"[AUTO-GEN] Error: {e}")
+    finally:
+        with AUTO_GEN_LOCK:
+            _auto_gen_running = False
+
+
+def _check_auto_gen_needed():
+    global _auto_gen_enabled, _auto_gen_threshold, _auto_gen_min_tokens, _auto_gen_count, _auto_gen_min_interval
+    config = load_config()
+    _auto_gen_enabled = config.get("auto_generate", True)
+    _auto_gen_threshold = config.get("auto_gen_threshold", 0.5)
+    _auto_gen_min_tokens = config.get("auto_gen_min_tokens", 3)
+    _auto_gen_count = config.get("auto_gen_count", 2)
+    _auto_gen_min_interval = config.get("auto_gen_cooldown", 1800)
+
+    if not _auto_gen_enabled:
+        return
+
+    max_tokens = config.get("auto_gen_max_tokens", 50)
+
+    with TOKEN_LOCK:
+        now = time.time()
+        if now - _last_auto_gen < _auto_gen_min_interval:
+            return
+
+        if len(TOKENS) >= max_tokens:
+            return
+
+        if len(TOKENS) == 0:
+            print(f"[AUTO-GEN] No tokens loaded, triggering initial generation...")
+            auto_generate_tokens("initial boot")
+            return
+
+        if not USAGE:
+            return
+
+        any_above_threshold = False
+        usable_count = 0
+        for key, stats in USAGE.items():
+            pcts = []
+            if stats["max_rpm"] > 0:
+                pcts.append(stats["minute_count"] / stats["max_rpm"])
+            if stats["window_limit"] > 0:
+                pcts.append(stats["window_count"] / stats["window_limit"])
+            if stats["week_limit"] > 0:
+                pcts.append(stats["week_count"] / stats["week_limit"])
+            max_pct = max(pcts) if pcts else 0
+            if max_pct >= _auto_gen_threshold:
+                any_above_threshold = True
+            if max_pct < 0.85:
+                usable_count += 1
+
+        total = len(USAGE)
+
+        if usable_count <= 1 and total > 0:
+            print(f"[AUTO-GEN] Only {usable_count}/{total} tokens usable, triggering generation...")
+            auto_generate_tokens("low token availability")
+        elif any_above_threshold:
+            print(f"[AUTO-GEN] Tokens at >= {_auto_gen_threshold*100:.0f}% usage, triggering generation...")
+            auto_generate_tokens("usage threshold reached")
+
+
+def sync_usage_loop(interval=30):
+    global _auto_gen_threshold, _auto_gen_enabled, TOKENS
+    first_run = True
     while True:
-        time.sleep(interval)
+        if not first_run:
+            time.sleep(interval)
+        first_run = False
         try:
             sync_usage_from_api()
         except Exception:
             pass
         try:
-            global TOKENS
             fresh = load_tokens()
             if fresh and len(fresh) != len(TOKENS):
                 TOKENS = fresh
@@ -613,6 +829,10 @@ def sync_usage_loop(interval=45):
                 print(f"[sync] Reloaded tokens: {len(TOKENS)} total")
         except Exception:
             pass
+        try:
+            _check_auto_gen_needed()
+        except Exception as e:
+            print(f"[AUTO-GEN] Check error: {e}")
 
 
 @app.route("/", methods=["GET"])
@@ -626,35 +846,74 @@ def index():
 
 @app.route("/api/proxy/generate", methods=["POST"])
 def proxy_generate_token():
+    global TOKENS
     data = request.get_json(silent=True) or {}
     count = int(data.get("count", 1))
     start = int(data.get("start", 1))
+    threaded = data.get("threaded", False)
+
     if count < 1:
         count = 1
+    if count > 10:
+        count = 10
 
-    try:
-        config = load_config()
-        config["account_count"] = count
-        config["start_index"] = start
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(config, f, indent=2)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    config = load_config()
+    existing = load_tokens()
+    existing_indices = {t["index"] for t in existing}
+    if start == 0 or data.get("start") is None:
+        start = max(existing_indices) + 1 if existing_indices else config.get("start_index", 1)
 
-    try:
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).parent / "token_manager.py"), "--no-input"],
-            cwd=str(Path(__file__).parent),
-            capture_output=True, text=True, timeout=600,
-        )
-        global TOKENS, USAGE
-        new_tokens = load_tokens()
-        if new_tokens:
+    print(f"\n[GEN] Starting generation of {count} accounts from index {start} (threaded={threaded})")
+
+    if threaded:
+        from token_manager import process_one_account as process_account
+
+        new_tokens = []
+        errors = []
+        with ThreadPoolExecutor(max_workers=min(count, 4)) as executor:
+            futures = {
+                executor.submit(process_account, config, start + i): start + i
+                for i in range(count)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    entry = future.result(timeout=120)
+                    if entry:
+                        new_tokens.append(entry)
+                        print(f"  [GEN] Account #{idx} done: {entry.get('email')}")
+                    else:
+                        errors.append(idx)
+                except Exception as e:
+                    print(f"  [GEN] Account #{idx} failed: {e}")
+                    errors.append(idx)
+
+        new_tokens.sort(key=lambda t: t["index"])
+        all_tokens = existing + new_tokens
+        save_tokens(all_tokens)
+        TOKENS = all_tokens
+        init_usage(TOKENS)
+
+        return jsonify({
+            "status": "done",
+            "tokens": len(new_tokens),
+            "total": len(all_tokens),
+            "errors": len(errors),
+        })
+    else:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "token_manager.py"),
+                 "--no-input", "--count", str(count), "--start", str(start)],
+                cwd=str(Path(__file__).parent),
+                capture_output=True, text=True, timeout=600,
+            )
+            new_tokens = load_tokens()
             TOKENS = new_tokens
             init_usage(TOKENS)
-        return jsonify({"status": "done", "tokens": len(TOKENS), "output": result.stdout[-500:]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            return jsonify({"status": "done", "tokens": len(TOKENS), "output": result.stdout[-500:]})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/proxy/config", methods=["GET"])
@@ -674,8 +933,13 @@ def proxy_config():
 
 @app.route("/api/proxy/status", methods=["GET"])
 def proxy_status():
+    config = load_config()
     return jsonify({
         "tokens_loaded": len(TOKENS),
+        "proxies_available": proxy_count(),
+        "auto_gen_enabled": config.get("auto_generate", True),
+        "auto_gen_threshold": config.get("auto_gen_threshold", 0.5),
+        "auto_gen": "running" if _auto_gen_running else "idle",
         "usage": {k: {
             "email": v["email"],
             "minute_count": v["minute_count"],
@@ -704,37 +968,91 @@ def proxy_refresh():
 
 
 def start_proxy(host="127.0.0.1", port=8787):
-    global TOKENS
+    global TOKENS, _auto_gen_enabled, _auto_gen_threshold, _auto_gen_count, _auto_gen_min_tokens
     config = load_config()
     host = config.get("proxy_host", host)
     port = config.get("proxy_port", port)
 
+    _auto_gen_enabled = config.get("auto_generate", True)
+    _auto_gen_threshold = config.get("auto_gen_threshold", 0.5)
+    _auto_gen_count = config.get("auto_gen_count", 2)
+    _auto_gen_min_tokens = config.get("auto_gen_min_tokens", 3)
+
+    print()
+    print(" ______                                  ______   __        __    __")
+    print("/      \\                                /      \\ /  |      /  |  /  |")
+    print("/$$$$$$  |  ______    ______   _______  /$$$$$$  |$$ |____  $$/  _$$ |_")
+    print("$$ |  $$ | /      \\  /      \\ /       \\ $$ \\__$$/ $$      \\ /  |/ $$   |")
+    print("$$ |  $$ |/$$$$$$  |/$$$$$$  |$$$$$$$  |$$      \\ $$$$$$$  |$$ |$$$$$$/")
+    print("$$ |  $$ |$$ |  $$ |$$    $$ |$$ |  $$ | $$$$$$  |$$ |  $$ |$$ |  $$ | __")
+    print("$$ \\__$$ |$$ |__$$ |$$$$$$$$/ $$ |  $$ |/  \\__$$ |$$ |  $$ |$$ |  $$ |/  |")
+    print("$$    $$/ $$    $$/ $$       |$$ |  $$ |$$    $$/ $$ |  $$ |$$ |  $$  $$/")
+    print(" $$$$$$/  $$$$$$$/   $$$$$$$/ $$/   $$/  $$$$$$/  $$/   $$/ $$/    $$$$/")
+    print("          $$ |")
+    print("          $$ |")
+    print("          $$/")
+    print("                    made by Pavlonoz <3")
+    print("=" * 74)
+    print()
+
+    if not RESIDENTIAL_FILE.exists():
+        print("  [ERROR] No residential_proxies.txt found!")
+        print("  [ERROR] Residential proxies are REQUIRED for account creation.")
+        print("  [ERROR] Get 10 free residential proxies at: https://webshare.io")
+        print("  [ERROR] File format: ip:port:user:pass (one per line)")
+        print()
+        return
+
+    res_count = 0
+    try:
+        res_count = sum(1 for l in open(RESIDENTIAL_FILE) if l.strip() and not l.strip().startswith("#") and l.count(":") >= 3)
+    except Exception:
+        pass
+    if res_count == 0:
+        print("  [ERROR] residential_proxies.txt is empty or has invalid format!")
+        print("  [ERROR] Format: ip:port:user:pass (one per line)")
+        print()
+        return
+
+    print("  Initializing proxy pool...")
+    load_and_filter()
+
     TOKENS = load_tokens()
-    if not TOKENS:
-        print("WARNING: No tokens loaded! Run token_manager.py first.")
-        print("The proxy will start but won't be able to forward requests.")
-    else:
+    if TOKENS:
         init_usage(TOKENS)
-        total_weekly = sum(
-            t.get("requests_per_week", 0) or 0 for t in TOKENS
-        )
-        print(f"Loaded {len(TOKENS)} tokens ({total_weekly} combined weekly requests)")
+        total_rpm = sum(t.get("max_rpm", 0) or 0 for t in TOKENS)
+        total_weekly = sum(t.get("requests_per_week", 0) or 0 for t in TOKENS)
+        print(f"  Tokens:     {len(TOKENS)} loaded ({total_weekly}/week, {total_rpm}/min)")
+    else:
+        print(f"  Tokens:     0 (will auto-generate on startup)")
 
-    print(f"\nProxy starting on http://{host}:{port}")
-    print(f"Status page: http://{host}:{port}/")
-    print(f"API status:  http://{host}:{port}/api/proxy/status")
-    print(f"\nFor CLAUDE CODE set:")
-    print(f'  set ANTHROPIC_BASE_URL=http://{host}:{port}/v1')
-    print(f'  set ANTHROPIC_API_KEY=anything')
-    print(f"\nFor OPENCODE set in opencode.json:")
-    print(f'  "baseURL": "http://{host}:{port}/v1"')
-    print(f"\nPress Ctrl+C to stop.\n")
+    print(f"  Proxies:    {proxy_count()} total ({res_count} residential)")
+    print(f"  Auto-gen:   {'ON' if _auto_gen_enabled else 'OFF'} (at {_auto_gen_threshold*100:.0f}%, {_auto_gen_count} at a time)")
+    print(f"  Dashboard:  http://{host}:{port}/")
+    print()
+    print(f"  Account creation takes 2-5 minutes per account.")
+    print(f"  For Claude Code: set ANTHROPIC_BASE_URL=http://{host}:{port}/v1")
+    print(f"  Press Ctrl+C to stop.")
+    print()
 
-    sync_thread = threading.Thread(target=sync_usage_loop, args=(45,), daemon=True)
+    sync_thread = threading.Thread(target=sync_usage_loop, args=(30,), daemon=True)
     sync_thread.start()
-    print("[sync] Background usage sync started (every 45s)")
+
+    proxy_refresh_thread = threading.Thread(target=_proxy_refresh_loop, args=(300,), daemon=True)
+    proxy_refresh_thread.start()
 
     app.run(host=host, port=port, debug=False, threaded=True)
+
+
+def _proxy_refresh_loop(interval=300):
+    while True:
+        time.sleep(interval)
+        try:
+            new_count = refresh_proxies()
+            test_proxy_batch(10)
+            print(f"[proxy-pool] Refreshed: {proxy_count()} proxies available")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

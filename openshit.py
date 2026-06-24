@@ -35,16 +35,30 @@ def save_json(path, data):
 def banner():
     console.print()
     console.print(Panel(
-        "[bold cyan]   ___                       __   _    __[/]\n"
-        "  / _ \\ ___  _ ___  ___ ___ _/ /  (_)__/ /_\n"
-        " / , _/ _ \\/ // _ \\/ -_) _ `/ _ \\/ / _  /\n"
-        "/_/|_/ .__/\\_, /_//_/\\_,_/\\_,_\\_/\\_,_/\\_\\\n"
-        "    /_/    /___/\n",
+        " ______                                  ______   __        __    __\n"
+        "/      \\                                /      \\ /  |      /  |  /  |\n"
+        "/$$$$$$  |  ______    ______   _______  /$$$$$$  |$$ |____  $$/  _$$ |_\n"
+        "$$ |  $$ | /      \\  /      \\ /       \\ $$ \\__$$/ $$      \\ /  |/ $$   |\n"
+        "$$ |  $$ |/$$$$$$  |/$$$$$$  |$$$$$$$  |$$      \\ $$$$$$$  |$$ |$$$$$$/\n"
+        "$$ |  $$ |$$ |  $$ |$$    $$ |$$ |  $$ | $$$$$$  |$$ |  $$ |$$ |  $$ | __\n"
+        "$$ \\__$$ |$$ |__$$ |$$$$$$$$/ $$ |  $$ |/  \\__$$ |$$ |  $$ |$$ |  $$ |/  |\n"
+        "$$    $$/ $$    $$/ $$       |$$ |  $$ |$$    $$/ $$ |  $$ |$$ |  $$  $$/\n"
+        " $$$$$$/  $$$$$$$/   $$$$$$$/ $$/   $$/  $$$$$$/  $$/   $$/ $$/    $$$$/\n"
+        "          $$ |\n"
+        "          $$ |\n"
+        "          $$/\n"
+        "               made by Pavlonoz <3",
         border_style="cyan",
         padding=(1, 2),
         subtitle="[dim]Openference Token Rotator[/]",
         subtitle_align="right",
     ))
+    res_file = ROOT / "residential_proxies.txt"
+    if not res_file.exists():
+        console.print("[yellow]No residential_proxies.txt found![/]")
+        console.print("[dim]Get free residential proxies: https://webshare.io[/]")
+        console.print("[dim]Format: ip:port:user:pass (one per line)[/]")
+        console.print()
 
 
 def show_status():
@@ -147,8 +161,12 @@ def configure():
 
 def start_proxy():
     if not TOKENS_PATH.exists() or not load_json(TOKENS_PATH):
-        console.print("[red]No tokens available! Generate tokens first (option 2).[/]")
-        return
+        config = load_json(CONFIG_PATH)
+        if config.get("auto_generate", True):
+            console.print("[yellow]No tokens yet, but auto-generation is ON. The proxy will create accounts automatically.[/]")
+        else:
+            console.print("[red]No tokens and auto-generation is OFF. Enable it in config or generate tokens first (option 2).[/]")
+            return
 
     config = load_json(CONFIG_PATH)
     port = config.get("proxy_port", 8787)
@@ -159,18 +177,24 @@ def start_proxy():
     console.print("[dim]Press Ctrl+C to stop the proxy[/]\n")
 
     server = subprocess.Popen(
-        [sys.executable, str(ROOT / "proxy.py")],
+        [sys.executable, "-u", str(ROOT / "proxy.py")],
         cwd=str(ROOT),
     )
     try:
-        time.sleep(2)
         import requests
-        try:
-            r = requests.get(f"http://{host}:{port}/api/proxy/status", timeout=3)
-            if r.status_code == 200:
-                console.print("[green]Proxy is running![/]")
-        except Exception:
-            console.print("[red]Proxy failed to start.[/]")
+        started = False
+        for retry in range(5):
+            time.sleep(2)
+            try:
+                r = requests.get(f"http://{host}:{port}/api/proxy/status", timeout=3)
+                if r.status_code == 200:
+                    console.print("[green]Proxy is running![/]")
+                    started = True
+                    break
+            except Exception:
+                pass
+        if not started:
+            console.print("[red]Proxy failed to start. Check proxy.py output above for errors.[/]")
             server.terminate()
             return
 
